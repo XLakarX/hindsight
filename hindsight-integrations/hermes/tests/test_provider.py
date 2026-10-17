@@ -721,6 +721,19 @@ def test_shutdown_drops_its_atexit_hook(provider, monkeypatch):
     assert not instance._atexit_registered
 
 
+def test_no_client_is_built_after_shutdown(provider):
+    """A prefetch/writer/daemon-start thread that outlives shutdown()'s bounded joins must not
+    build a fresh client: no one closes it any more ("Unclosed client session")."""
+    instance, _ = provider({})
+    instance._get_client()
+    instance.shutdown()
+    with pytest.raises(RuntimeError, match="shut down"):
+        instance._get_client()
+    assert instance._client is None
+    instance.initialize("again", platform="cli")  # a reused provider may build one again
+    assert instance._get_client() is not None
+
+
 def test_availability_failure_is_logged(hermes_env, caplog):
     """#4662: is_available swallowed the error, so a broken config showed no reason anywhere."""
     (hermes_env / "hindsight").mkdir(parents=True, exist_ok=True)

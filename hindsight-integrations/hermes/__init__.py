@@ -488,6 +488,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._config = self._api_key = self._client = None
         self._embedded_url = None
         self._client_lock = threading.Lock()
+        self._client_closed = False  # set by shutdown(): _get_client() must not build a new client
         self._api_url, self._mode = _DEFAULT_API_URL, "cloud"
         self._timeout, self._idle_timeout = _DEFAULT_TIMEOUT, _DEFAULT_IDLE_TIMEOUT
         self._bank_id, self._budget, self._bank_id_template = "hermes", "mid", ""
@@ -940,6 +941,10 @@ class HindsightMemoryProvider(MemoryProvider):
         """
         with self._client_lock:
             if self._client is None:
+                if self._client_closed:
+                    # A thread that outlived shutdown()'s bounded joins would build a client no
+                    # one closes any more ("Unclosed client session").
+                    raise RuntimeError("Hindsight provider already shut down")
                 self._client = (
                     self._new_embedded_client() if self._mode == "local_embedded" else self._new_cloud_client()
                 )
@@ -976,6 +981,8 @@ class HindsightMemoryProvider(MemoryProvider):
             return
         # A previous writer may have exited after shutdown(); allow the fresh one to drain.
         self._shutting_down.clear()
+        with self._client_lock:
+            self._client_closed = False
         thread = spawn_context_thread(self._writer_loop, name="hindsight-writer")
         self._writer_thread = self._sync_thread = thread
         thread.start()
@@ -1127,6 +1134,8 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- lifecycle ---------------------------------------------------------------
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        with self._client_lock:
+            self._client_closed = False  # a re-initialized provider may build a client again
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
         # "primary" | "subagent" | "cron" | "flush"; read by _apply_retain_policy (#4945).
@@ -2055,10 +2064,13 @@ class HindsightMemoryProvider(MemoryProvider):
             # The hook holds this provider alive until exit; the gateway makes one per chat session.
             atexit.unregister(self._atexit_shutdown)
             self._atexit_registered = False
-        if self._client is not None:
-            with contextlib.suppress(Exception):
-                self._close_client()
-            self._client = None
+        # Under the lock: no thread may build a new client between close and reset, nor after.
+        with self._client_lock:
+            if self._client is not None:
+                with contextlib.suppress(Exception):
+                    self._close_client()
+                self._client = None
+            self._client_closed = True
         # The module-global loop is intentionally NOT stopped: it's shared by every
         # provider in the process (one per gateway chat session); stopping it would
         # strand siblings' aiohttp sessions ("Unclosed client session"). Daemon
